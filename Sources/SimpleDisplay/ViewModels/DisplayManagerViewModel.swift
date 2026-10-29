@@ -692,15 +692,52 @@ final class DisplayManagerViewModel {
     }
 
     /// Reconfigure a virtual display by recreating it with new settings.
-    func reconfigureVirtualDisplay(_ display: DisplayInfo, width: Int, height: Int, refreshRate: Double = 60, hiDPI: Bool = false, name: String? = nil) {
+    /// `refreshRate` defaults to the display's saved rate so resizing a 120 Hz
+    /// display never silently drops it back to 60 Hz.
+    func reconfigureVirtualDisplay(_ display: DisplayInfo, width: Int, height: Int, refreshRate: Double? = nil, hiDPI: Bool = false, name: String? = nil) {
         guard !isBusy else { return }
         isBusy = true
         busyMessage = t("reconfiguring")
         Task {
             defer { isBusy = false; busyMessage = nil }
             let displayName = name ?? display.name
-            // Keep the display's identity (serial) across the recreate, so
-            // ColorSync and macOS's per-display mode memory see the same device.
+            let savedRefresh = virtualService.config(for: display.id)?.refreshRate
+                ?? (display.currentMode.refreshRate > 0 ? display.currentMode.refreshRate : 60)
+            let effectiveRefresh = refreshRate ?? savedRefresh
+
+            // Renaming needs a new CGVirtualDisplay descriptor (the name is fixed
+            // at creation), so only then do we destroy and recreate.
+            let wantsRename = name != nil && name != display.name
+
+            if !wantsRename {
+                // Reconfigure the live CGVirtualDisplay in place. Destroying and
+                // recreating it makes the window server hand this process a stale
+                // display list: CGGetOnlineDisplayList/CGGetActiveDisplayList then
+                // keep reporting the destroyed display and never the new one, so
+                // the app loses sight of its own displays. applySettings has no
+                // such effect (verified against a standalone CGVirtualDisplay
+                // probe), and it also keeps the display ID stable.
+                do {
+                    try virtualService.reconfigureDisplay(
+                        id: display.id,
+                        width: width,
+                        height: height,
+                        refreshRate: effectiveRefresh,
+                        hiDPI: hiDPI
+                    )
+                    virtualDisplayNames[display.id] = displayName
+                } catch {
+                    errorMessage = error.localizedDescription
+                    return
+                }
+                navigationState = .displayList
+                await settleAndRefresh()
+                return
+            }
+
+            // Rename path: keep the display's identity (serial) across the
+            // recreate, so ColorSync and macOS's per-display mode memory see the
+            // same device.
             let serial = virtualService.serial(for: display.id)
             await forgetDisabledState(of: display)
             virtualService.removeVirtualDisplay(id: display.id)
@@ -710,7 +747,7 @@ final class DisplayManagerViewModel {
             let config = VirtualDisplayService.VirtualDisplayConfig(
                 name: displayName,
                 width: width, height: height,
-                refreshRate: refreshRate, hiDPI: hiDPI,
+                refreshRate: effectiveRefresh, hiDPI: hiDPI,
                 serial: serial
             )
             do {
