@@ -40,6 +40,12 @@ final class DisplayManagerViewModel {
     /// Human-readable status of the current operation
     var busyMessage: String?
 
+    /// URL commands that arrived while another display operation was running.
+    /// They are executed one after another instead of being dropped, so a
+    /// remote controller can fire several commands back to back.
+    private var pendingURLCommands: [URLCommand] = []
+    private var isDrainingURLCommands = false
+
     var navigationState: NavigationState = .displayList
     /// True briefly during navigation transitions to prevent rapid clicks
     var isNavigating: Bool = false
@@ -772,10 +778,33 @@ final class DisplayManagerViewModel {
     /// equivalent button — this is just another entry point, not a shadow
     /// execution path.
     func execute(urlCommand command: URLCommand) {
+        pendingURLCommands.append(command)
+        drainURLCommands()
+    }
+
+    /// Runs queued URL commands one at a time. A command that arrives while a
+    /// display operation is still settling used to be dropped silently
+    /// (`guard !isBusy else { return }`), which made back-to-back CLI commands
+    /// unreliable; now it waits its turn instead.
+    private func drainURLCommands() {
+        guard !isDrainingURLCommands, !pendingURLCommands.isEmpty else { return }
+        guard !isBusy else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.drainURLCommands() }
+            return
+        }
+        isDrainingURLCommands = true
+        let command = pendingURLCommands.removeFirst()
         // ColorSyncUnregisterDevice -> AuthorizationCreate hace XPC sincronico que se
         // deadlockea dentro del handler de Apple Events (GURL). Diferir el comando al
         // siguiente ciclo del runloop para ejecutarlo fuera de ese contexto.
-        DispatchQueue.main.async { self.executeNow(urlCommand: command) }
+        DispatchQueue.main.async {
+            self.executeNow(urlCommand: command)
+            // Let the command's Task set isBusy, then wait until it finishes.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                self.isDrainingURLCommands = false
+                self.drainURLCommands()
+            }
+        }
     }
 
     private func executeNow(urlCommand command: URLCommand) {
